@@ -3,6 +3,7 @@ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
+import { fromOpenAIFinish } from "../../translator/concerns/finishReason.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
@@ -102,6 +103,57 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
       input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+    },
+  };
+}
+
+/**
+ * Convert a Chat Completions body into Claude Messages shape. Same gap
+ * `chatCompletionToResponses` fills for Responses clients: a Claude-format
+ * client whose provider forces streaming got a raw `chat.completion` body back
+ * from this path, which it cannot parse (it wants `{"type":"message"}`), so the
+ * reply was dropped and the request looked like an empty response. Inlined for
+ * the same circular-import reason as chatCompletionToResponses.
+ */
+function chatCompletionToClaudeMessage(parsed) {
+  const choice = parsed?.choices?.[0];
+  if (!choice) return parsed;
+  const message = choice.message || {};
+  const content = [];
+  const reasoning = message.reasoning_content || message.provider_specific_fields?.reasoning_content || "";
+  if (reasoning) content.push({ type: "thinking", thinking: reasoning });
+  if (typeof message.content === "string" && message.content.length > 0) {
+    content.push({ type: "text", text: message.content });
+  }
+  let idx = 0;
+  for (const toolCall of message.tool_calls || []) {
+    const fn = toolCall.function || {};
+    let input = fn.arguments ?? toolCall.arguments;
+    if (typeof input === "string") {
+      try { input = JSON.parse(input); } catch { input = { raw: input }; }
+    }
+    content.push({
+      type: "tool_use",
+      id: toolCall.id || `toolu_${Date.now()}_${idx}`,
+      name: fn.name || toolCall.name || "",
+      input: input ?? {},
+    });
+    idx += 1;
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
+
+  const usage = parsed.usage || {};
+  return {
+    id: String(parsed.id || `msg_${Date.now()}`).replace(/^chatcmpl-/, ""),
+    type: "message",
+    role: "assistant",
+    model: parsed.model || "unknown",
+    content,
+    stop_reason: fromOpenAIFinish(choice.finish_reason, FORMATS.CLAUDE),
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+      output_tokens: usage.completion_tokens || usage.output_tokens || 0,
     },
   };
 }
@@ -350,15 +402,18 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       }
     }
 
-    // A Responses-format client (e.g. Codex) forced this provider to stream,
-    // but wants JSON back. parseSSEToOpenAIResponse yields a Chat Completions
-    // body; convert it to the Responses `output` shape so tool_calls are not
-    // lost on the non-streaming return path. Inlined (not imported from
+    // A Responses- or Claude-format client forced this provider to stream, but
+    // wants JSON back. parseSSEToOpenAIResponse yields a Chat Completions body;
+    // convert it to the client's shape so tool_calls and text are not lost on
+    // the non-streaming return path. Inlined (not imported from
     // nonStreamingHandler.js) to avoid a circular import: nonStreamingHandler
     // already imports parseSSEToOpenAIResponse from this module.
-    const finalBody = sourceFormat === FORMATS.OPENAI_RESPONSES
-      ? chatCompletionToResponses(parsed, customToolNames)
-      : parsed;
+    let finalBody = parsed;
+    if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+      finalBody = chatCompletionToResponses(parsed, customToolNames);
+    } else if (sourceFormat === FORMATS.CLAUDE) {
+      finalBody = chatCompletionToClaudeMessage(parsed);
+    }
 
     return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
   } catch (err) {

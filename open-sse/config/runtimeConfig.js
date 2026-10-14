@@ -52,6 +52,18 @@ export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search")
 // slow reasoning models aren't aborted mid-stream. Env: STREAM_STALL_TIMEOUT_MS.
 export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 1000);
 
+// Idle gap after which the client is sent a keepalive frame while the upstream
+// is still prefilling, so its own idle timer does not fire first. Env:
+// STREAM_KEEPALIVE_MS (raised to spend fewer frames on a known-slow model).
+export const STREAM_KEEPALIVE_MS = envMs("STREAM_KEEPALIVE_MS", 3 * 1000);
+
+// How long a streaming request may stay un-answered before the response is
+// committed to SSE and kept alive, instead of waiting for the upstream
+// handshake. Short enough to stay under a client's idle timer; long enough that
+// a fast rejection (bad key, unknown model) still returns its real status code
+// rather than a 200 stream. Env: STREAM_KEEPALIVE_GRACE_MS.
+export const STREAM_KEEPALIVE_GRACE_MS = envMs("STREAM_KEEPALIVE_GRACE_MS", 3000);
+
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 

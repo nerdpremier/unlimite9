@@ -18,6 +18,8 @@ services:
       NODE_ENV: production
       INITIAL_PASSWORD: "123456"
       HEADROOM_URL: http://headroom:8787
+      MODEL_CATALOG_SYNC: "off"
+      STREAM_KEEPALIVE_GRACE_MS: "1"
     depends_on:
       - headroom
 

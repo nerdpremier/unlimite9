@@ -1,7 +1,7 @@
 import { FORMATS } from "../../translator/formats.js";
 import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
-import { pipeWithDisconnect } from "../../utils/streamHandler.js";
+import { pipeWithDisconnect, withStreamKeepalive } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
@@ -62,6 +62,44 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   // and clamped so untrusted upstream text never reaches the client verbatim
   // (the UI may render error.message as HTML).
   const upstreamContentType = (providerResponse.headers.get('content-type') || '').toLowerCase();
+  
+  // Early detection: upstream sends event-stream but body is suspiciously small.
+  // This catches cases like opencode.ai returning HTTP 200 + event-stream headers
+  // with only metadata (e.g. 589 bytes) and no actual data events.
+  // Return an object with `isEmptySSE` flag so the caller can auto-retry.
+  let isEmptySSE = false;
+  if (upstreamContentType.includes('text/event-stream')) {
+    try {
+      const bodyText = await providerResponse.clone().text();
+      const bodyBytes = new TextEncoder().encode(bodyText).byteLength;
+      // SSE streams from Claude typically produce kilobytes of events.
+      // < 2KB with no data: lines is almost certainly an empty/error stream.
+      if (bodyBytes < 1024) {
+        const dataLines = bodyText.split('\n').filter(l => l.trim().startsWith('data:')).length;
+        if (dataLines === 0) {
+          isEmptySSE = true;
+          const errMsg = `Upstream sent event-stream with ${bodyBytes}B, 0 data events`;
+          if (log?.errorLine) log.errorLine(reqTag, "⚠", `EMPTY_SSE · ${provider}/${model} · ${bodyBytes}B event-stream with no data events (will retry)`);
+          else console.warn(`[STREAM] ${provider} | ${model} | empty SSE stream: ${bodyBytes}B, 0 data events — retrying`);
+          // Return a special marker so chatCore.js can auto-retry
+          return {
+            success: false,
+            isEmptySSE: true,
+            bodyBytes,
+            response: new Response(JSON.stringify({
+              error: { message: `[${providerResponse.status || 200}]: Upstream returned empty event-stream (${bodyBytes} bytes, no events) — retrying` }
+            }), {
+              status: providerResponse.status || 200,
+              headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            }),
+          };
+        }
+      }
+    } catch {
+      // If we can't read the body for detection, proceed normally
+    }
+  }
+  
   if (upstreamContentType && !upstreamContentType.includes('text/event-stream') && !upstreamContentType.includes('application/json')) {
     const bodyText = await providerResponse.text().catch(() => '');
     const titleMatch = bodyText.match(/<title>([^<]+)<\/title>/i);
@@ -108,9 +146,26 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     console.error("[RequestDetail] Failed to save streaming request:", err.message);
   });
 
+  // Detect empty SSE streams from upstream (e.g., opencode.ai returning 200 + event-stream + no events)
+  // This wraps the response so we can surface a clear error when no events arrive
+  const emptyStreamDetector = new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      controller.close();
+    }
+  });
+
+  // Wrap the transformed stream with keepalive pings so client idle timers don't fire first
+  const streamBody = withStreamKeepalive(transformedBody, sourceFormat === FORMATS.CLAUDE);
+
   return {
     success: true,
-    response: new Response(transformedBody, { headers: { ...SSE_HEADERS, ...upstreamResponseHeaders(providerResponse.headers) } })
+    response: new Response(
+      streamBody,
+      { headers: { ...SSE_HEADERS, ...upstreamResponseHeaders(providerResponse.headers) } }
+    )
   };
 }
 
@@ -125,6 +180,12 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
     };
+    
+    // Detect empty SSE stream from upstream: HTTP 200 + content-type: event-stream
+    // but no events (opencode.ai returns 589 bytes of SSE header with no events)
+    const contentLength = (contentObj?.content || '').length;
+    const emptyStream = !contentLength || contentLength === 0;
+    
     const safeContent = contentObj?.content || "[Empty streaming response]";
     const safeThinking = contentObj?.thinking || null;
 

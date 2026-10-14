@@ -524,7 +524,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Streaming response
   const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials });
+  let streamingResult = await handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials });
+
+  // Auto-retry on empty SSE stream (upstream sent event-stream with no data events).
+  // This is a transient issue with opencode.ai gateway — the 2nd attempt usually succeeds.
+  if (streamingResult?.isEmptySSE) {
+    log?.info?.("RETRY", `${provider.toUpperCase()} | ${model} | empty SSE (${streamingResult.bodyBytes}B), retrying`);
+    try {
+      const retryResult = await executor.execute({
+        model,
+        body: translatedBody,
+        stream,
+        credentials,
+        providerSessionId: sessionSeed,
+        clientTool,
+        signal: streamController.signal,
+        log,
+        proxyOptions,
+        providerOverrides,
+      });
+      if (retryResult.response.ok) {
+        log?.info?.("RETRY", `${provider.toUpperCase()} | ${model} | retry succeeded`);
+        const { onStreamComplete: onStreamComplete2, streamDetailId: streamDetailId2 } = buildOnStreamComplete({ ...sharedCtx });
+        return await handleStreamingResponse({ ...sharedCtx, providerResponse: retryResult.response, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete: onStreamComplete2, streamDetailId: streamDetailId2, credentials });
+      }
+    } catch (retryErr) {
+      log?.warn?.("RETRY", `${provider.toUpperCase()} | ${model} | retry failed: ${retryErr.message}`);
+    }
+  }
+  return streamingResult;
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

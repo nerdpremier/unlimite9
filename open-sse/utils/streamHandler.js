@@ -1,6 +1,8 @@
 // Stream handler with disconnect detection - shared for all providers
-import { STREAM_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, STREAM_KEEPALIVE_MS, STREAM_KEEPALIVE_GRACE_MS, HTTP_STATUS } from "../config/runtimeConfig.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
+import { buildStreamErrorBytes } from "./streamHelpers.js";
+import { FORMATS } from "../translator/formats.js";
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
@@ -258,3 +260,184 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   );
 }
 
+/**
+ * Keep the client's own idle timer alive while it waits for output.
+ *
+ * Prefill on the free upstreams this router fans out to can take a minute or
+ * more before the first token, and nothing is written to the client in the
+ * meantime, so the client gives up first — observed as a single stream event
+ * followed by silence and a "no events" failure, after which the client retries
+ * the request non-streaming. A keepalive resets that timer without adding
+ * content: an Anthropic client gets the `ping` event the real API also sends,
+ * every other client a comment frame, which the SSE spec tells parsers to
+ * ignore.
+ *
+ * @param {ReadableStream} readable client-facing SSE body
+ * @param {boolean} isClaudeClient whether the client speaks the Claude format
+ */
+export function withStreamKeepalive(readable, isClaudeClient, intervalMs = STREAM_KEEPALIVE_MS) {
+  if (!(intervalMs > 0)) return readable;
+  const reader = readable.getReader();
+  const encoder = new TextEncoder();
+  const frame = isClaudeClient ? 'event: ping\ndata: {"type":"ping"}\n\n' : ": keepalive\n\n";
+  // One read is kept outstanding across pulls: starting a fresh read on every
+  // keepalive would queue reads behind each other and reorder the chunks.
+  let pending = reader.read();
+  return new ReadableStream({
+    async pull(controller) {
+      let timer = null;
+      const keepaliveWon = await Promise.race([
+        pending.then(() => false).catch(() => false),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(true), intervalMs); })
+      ]);
+      clearTimeout(timer);
+      if (keepaliveWon) { controller.enqueue(encoder.encode(frame)); return; }
+      let result;
+      try {
+        result = await pending;
+      } catch {
+        controller.close();
+        return;
+      }
+      if (result.done) { controller.close(); return; }
+      controller.enqueue(result.value);
+      pending = reader.read();
+    },
+    cancel(reason) {
+      pending.catch(() => {});
+      return reader.cancel(reason);
+    }
+  });
+}
+
+
+/**
+ * Whether the client expects an event stream on this connection.
+ *
+ * The wire default is non-streaming on both the OpenAI and the Anthropic
+ * format: a request that does not say `stream: true` is answered with a single
+ * JSON body. Accept is checked first because it is free; the body is parsed
+ * only when the header says nothing useful.
+ *
+ * @param {Request} request
+ * @returns {Promise<boolean>}
+ */
+export async function clientWantsStream(request) {
+  const accept = (request?.headers?.get?.("accept") || "").toLowerCase();
+  if (accept.includes("text/event-stream")) return true;
+  if (typeof request?.clone !== "function") return true;
+  try {
+    const body = await request.clone().json();
+    return body?.stream === true;
+  } catch {
+    // Unreadable body: this request is about to fail on its own terms, so keep
+    // the streaming default instead of gambling on the client's contract.
+    return true;
+  }
+}
+
+/**
+ * Commit a streaming request to SSE while the upstream handshake is still in
+ * flight, then hand the real reply's body over to the same stream.
+ *
+ * `handleChatCore` answers only after the upstream returns headers — it walks
+ * the account fallbacks and waits out their backoff, so a struggling upstream
+ * leaves the client with no response bytes at all (measured: 21s from request
+ * to first byte, every one of those seconds spent here). A client on an idle
+ * timer gives up first, and its retry takes a different code path. Emitting the
+ * keepalive early resets that timer; the body is forwarded rather than closed
+ * so nothing about the reply itself changes.
+ *
+ * A failure that resolves inside the grace period is returned untouched, with
+ * its real status code — a bad key or unknown model still answers as itself.
+ *
+ * @param {() => Promise<Response>} run work resolving to the real response
+ * @param {boolean} isClaudeClient whether the client speaks the Claude format
+ * @param {{ graceMs?: number, wantsStream?: boolean }|number} opts graceMs to
+ *   wait for the real reply, wantsStream false when the client asked for a
+ *   single JSON body and must not be committed to SSE (a bare number is read as
+ *   graceMs)
+ */
+export async function withEarlySseHeaders(run, isClaudeClient, opts = {}) {
+  const { graceMs = STREAM_KEEPALIVE_GRACE_MS, wantsStream = true } =
+    typeof opts === "number" ? { graceMs: opts } : opts;
+  const settled = Promise.resolve().then(run);
+  // Claim a rejection handler: the losing branch of the race stays a live
+  // promise, so a later failure must not reach the process as unhandled.
+  settled.catch(() => {});
+  // A client that asked for one JSON body cannot be handed an event stream: the
+  // frames are not JSON, so it parses nothing out of a 200 and reports an empty
+  // response — observed as "the non-streaming request was answered with a
+  // stream" on the Anthropic-format client's non-stream retry. Such a request
+  // waits for the real answer instead of being committed here.
+  if (!wantsStream || !(graceMs > 0)) return settled;
+
+  let early = false;
+  await Promise.race([
+    settled.then(() => {}, () => {}),
+    new Promise((resolve) => setTimeout(() => { early = true; resolve(); }, graceMs))
+  ]);
+  if (!early) return settled;
+
+  const encoder = new TextEncoder();
+  const frame = isClaudeClient ? 'event: ping\ndata: {"type":"ping"}\n\n' : ": keepalive\n\n";
+  let heartbeat = null;
+  const body = new ReadableStream({
+    async start(controller) {
+      controller.enqueue(encoder.encode(frame));
+      heartbeat = setInterval(() => {
+        try { controller.enqueue(encoder.encode(frame)); } catch { clearInterval(heartbeat); }
+      }, STREAM_KEEPALIVE_MS);
+      try {
+        const res = await settled;
+        clearInterval(heartbeat);
+        // Stream already ended without a body: surface it as a terminal error
+        // frame rather than a silent stall.
+        if (!res?.body) {
+          controller.enqueue(buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream returned no response body", isClaudeClient ? FORMATS.CLAUDE : FORMATS.OPENAI));
+          controller.close();
+          return;
+        }
+        // The reply has to be a stream itself. A JSON error (rate limit, bad
+        // key, model not found) pasted into the event stream leaves the client
+        // with zero events and no reason — it reports an empty response rather
+        // than the upstream's message, so surface that as a terminal error
+        // frame in the client's own format.
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("text/event-stream")) {
+          const text = await res.text().catch(() => "");
+          let message = `Upstream answered ${res.status} without a stream`;
+          try {
+            const parsed = JSON.parse(text);
+            const detail = parsed?.error?.message || parsed?.error || parsed?.message;
+            if (typeof detail === "string" && detail) message = detail;
+          } catch { /* not JSON: keep the status-based message */ }
+          controller.enqueue(buildStreamErrorBytes(res.ok ? HTTP_STATUS.BAD_GATEWAY : res.status, message, isClaudeClient ? FORMATS.CLAUDE : FORMATS.OPENAI));
+          controller.close();
+          return;
+        }
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
+      } catch (err) {
+        clearInterval(heartbeat);
+        try {
+          controller.enqueue(buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, "Upstream stream failed", isClaudeClient ? FORMATS.CLAUDE : FORMATS.OPENAI));
+          controller.close();
+        } catch { /* client already gone */ }
+        dbg("KEEPALIVE", `early SSE stream failed: ${err?.message || err}`);
+      }
+    },
+    cancel() {
+      clearInterval(heartbeat);
+      // Only the client can observe this stream, so its cancellation is the
+      // disconnect; the upstream aborts through the shared stream controller.
+      settled.then((res) => res?.body?.cancel?.().catch(() => {}), () => {});
+    }
+  });
+  return new Response(body, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*" } });
+}
