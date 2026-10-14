@@ -146,17 +146,6 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     console.error("[RequestDetail] Failed to save streaming request:", err.message);
   });
 
-  // Detect empty SSE streams from upstream (e.g., opencode.ai returning 200 + event-stream + no events)
-  // This wraps the response so we can surface a clear error when no events arrive
-  const emptyStreamDetector = new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-    },
-    flush(controller) {
-      controller.close();
-    }
-  });
-
   // Wrap the transformed stream with keepalive pings so client idle timers don't fire first
   const streamBody = withStreamKeepalive(transformedBody, sourceFormat === FORMATS.CLAUDE);
 

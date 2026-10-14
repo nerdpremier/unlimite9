@@ -534,12 +534,7 @@ export function createSSEStream(options = {}) {
     }
   });
 
-  // Attach a getter so callers can check how many events were emitted
-  // (useful for detecting empty SSE streams from upstream)
-  const wrapped = Object.create(stream, {
-    getEventsEmitted: { value: () => sseEmittedCount }
-  });
-  return wrapped;
+  return stream;
 }
 
 export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null) {
